@@ -1,0 +1,72 @@
+PATIENT DB MCP SERVER - IMPLEMENTATION PLAN
+============================================
+
+Goal: an MCP server that lets an AI assistant query a SQLite healthcare database
+(Patients, Visits, Diagnoses, Medications, Lab_Results) through safe, read-only tools.
+
+Status legend:  [x] done and tested   [ ] not started / future
+
+
+PHASE 1 - Project setup
+  [x] Folder structure (server.py, db.py, seed_data.py, tools/, documentation/)
+  [x] requirements.txt  -> mcp[cli]>=2,<3, uvicorn, starlette
+      (sqlite3 is part of Python's standard library, so it is NOT listed)
+
+PHASE 2 - Data layer
+  [x] seed_data.py  create the 5 tables and fill them with 60 synthetic patients
+  [x] db.py         single read-only connection helper (mode=ro) + query()/query_one()
+
+PHASE 3 - Tools (one module each in tools/)
+  [x] schema_tool.py   get_database_schema        - tables, columns, row counts
+  [x] query_tool.py    search_patients            - name -> patient_id
+                       query_patient_details      - full patient record
+                       run_sql_query              - read-only SELECT, 100-row cap
+  [x] risk_summary.py  get_patient_risk_summary   - scored, explainable risk level
+  [x] readmission.py   get_readmission_analysis   - 30-day readmissions + rate
+  [x] tools/__init__.py register_all() wires every module into the server
+
+PHASE 4 - Server
+  [x] server.py   create MCPServer, register tools, choose transport
+                  (stdio default; streamable-http; sse = deprecated)
+  [x] Fail fast with a clear message when patients.db is missing
+
+PHASE 4b - Browser client
+  [x] server.py --cors-origin ORIGIN (HTTP only): CORS for exact origins, exposes the
+      Mcp-Session-Id header, extends the SDK Origin check; "*" and bad values are rejected
+  [x] client/index.html  single-file client, no build step, no external libraries
+      connect -> list tools -> form generated from each tool's JSON schema -> call tool
+      results as Table / JSON / Raw, plus a Protocol log of every JSON-RPC message
+  [x] Serve with:  python -m http.server 3000 --directory client
+  [ ] Optional later: an LLM chat page. It needs an API key, so it must call a small
+      backend of yours; never put an API key in browser code.
+
+PHASE 5 - Testing (done with a real MCP client)
+  [x] List All Tools returns the 6 tools over stdio and Streamable HTTP
+  [x] Every tool called; results cross-checked against independent Python logic
+      (readmissions: SQL join result == plain-Python loops)
+  [x] Abuse cases rejected and data unchanged: DROP TABLE, stacked statements,
+      WITH ... DELETE, unknown patient, bad argument type
+  [x] Works when started from a different working directory
+  [x] Browser client tested in a real browser (headless Edge, 26 checks):
+        - without --cors-origin the browser blocks the call and the page shows the fix
+        - with it: connect, list tools, run every kind of form, tool errors shown,
+          client-side validation, session-expired handling, reconnect
+        - a page on a non-allowed origin is refused
+        - HTML inside database values is displayed as text, not executed
+        - no horizontal scroll at phone width; light and dark mode
+  [ ] Try it with a real client: Claude Desktop / Claude Code / `mcp dev server.py`
+
+PHASE 6 - Ideas for later
+  [ ] Expose the schema as an MCP *resource* and add an MCP *prompt* template
+  [ ] Authentication in front of the HTTP transport before any network use
+  [ ] Audit log of every tool call (who asked for which patient)
+  [ ] Automated tests (pytest) for each tool
+  [ ] Swap synthetic data for a real database only after privacy/compliance review
+
+
+HOW TO RUN
+  python -m venv .venv ; .venv\Scripts\activate
+  pip install -r requirements.txt
+  python seed_data.py
+  python server.py                                 (stdio)
+  python server.py --transport streamable-http     (http://127.0.0.1:8000/mcp)

@@ -1,0 +1,686 @@
+<!doctype html>
+<!--
+  index.html - A browser MCP client for the patient database server.
+
+  It plays the "MCP Client" box from the project diagram, but in a web page:
+      this page  ==fetch()==>  http://127.0.0.1:8000/mcp  (server.py, Streamable HTTP)
+
+  There is NO LLM here. You pick a tool and fill in its arguments yourself.
+  That makes it a good way to see exactly what the protocol does:
+      1. initialize               -> server replies with a session id
+      2. notifications/initialized
+      3. tools/list               ("List All Tools" in the diagram)
+      4. tools/call               ("Call Tool" in the diagram)
+  Every message is shown in the "Protocol log" at the bottom.
+
+  To use it, start the server with CORS enabled for this page's origin, then serve this folder:
+      python server.py --transport streamable-http --cors-origin http://localhost:3000
+      python -m http.server 3000 --directory client
+  and open http://localhost:3000 (not file://, whose origin is "null" and is not allowed).
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Patient DB MCP Client</title>
+<style>
+  /* ---- Colours are CSS variables so dark mode only has to redefine them ---- */
+  :root {
+    --bg: #f4f7f8; --surface: #ffffff; --surface-2: #eef3f4; --border: #d5dee1;
+    --text: #17262b; --muted: #5d7076; --accent: #0f766e; --accent-text: #ffffff;
+    --danger: #b42318; --danger-bg: #fdecea; --ok: #15803d;
+    --key: #0f5f8a; --str: #1f7a3d; --num: #a14a00; --bool: #7c3aed;
+    --mono: ui-monospace, "Cascadia Code", Consolas, Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0e1518; --surface: #151e22; --surface-2: #1b272c; --border: #2b3a40;
+      --text: #e4eef0; --muted: #93a8ae; --accent: #2dd4bf; --accent-text: #05211e;
+      --danger: #f97066; --danger-bg: #3a1815; --ok: #4ade80;
+      --key: #7cc4f0; --str: #86d99b; --num: #f0b072; --bool: #c4a1fa;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 1180px; margin: 0 auto; padding: 20px 16px 48px; }
+  h1 { font-size: 20px; margin: 0 0 16px; }
+  h1 span { color: var(--muted); font-weight: 400; }
+  h2 { font-size: 13px; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); margin: 0 0 10px; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+  .muted { color: var(--muted); }
+  code, pre, .mono { font-family: var(--mono); font-size: 13px; }
+
+  /* ---- Connection bar ---- */
+  .connect { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 14px; }
+  .connect label { font-weight: 600; }
+  .connect input { flex: 1 1 280px; min-width: 0; }
+  input, textarea, select { font: inherit; color: var(--text); background: var(--surface);
+         border: 1px solid var(--border); border-radius: 7px; padding: 8px 10px; width: 100%; }
+  textarea { font-family: var(--mono); font-size: 13px; resize: vertical; }
+  input:focus-visible, textarea:focus-visible, select:focus-visible, button:focus-visible, summary:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 1px; }
+  button { font: inherit; font-weight: 600; cursor: pointer; border-radius: 7px; padding: 8px 16px;
+           border: 1px solid var(--accent); background: var(--accent); color: var(--accent-text); }
+  button.secondary { background: transparent; color: var(--text); border-color: var(--border); }
+  button:disabled { opacity: .55; cursor: not-allowed; }
+  .pill { font-size: 13px; padding: 3px 10px; border-radius: 99px; background: var(--surface-2); color: var(--muted); }
+  .pill.on { color: var(--ok); }
+
+  /* ---- Error banner ---- */
+  #banner { margin-bottom: 14px; padding: 12px 14px; border-radius: 8px; border: 1px solid var(--danger);
+            background: var(--danger-bg); color: var(--text); }
+  #banner strong { color: var(--danger); }
+  #banner pre { margin: 8px 0 0; padding: 8px 10px; background: var(--surface); border-radius: 6px; overflow-x: auto; }
+
+  /* ---- Two-column layout: tool list | selected tool ---- */
+  .layout { display: grid; grid-template-columns: 270px minmax(0, 1fr); gap: 14px; align-items: start; }
+  .layout > * { min-width: 0; }   /* let wide tables scroll inside their card instead of stretching the page */
+  /* minmax(0, 1fr), not 1fr: a plain 1fr never shrinks below its widest content. */
+  @media (max-width: 760px) { .layout { grid-template-columns: minmax(0, 1fr); } }
+  #toolList { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+  #toolList button { width: 100%; text-align: left; background: var(--surface-2); color: var(--text);
+                     border: 1px solid transparent; padding: 9px 11px; font-weight: 400; }
+  #toolList button[aria-current="true"] { border-color: var(--accent); }
+  #toolList .name { display: block; font-family: var(--mono); font-size: 13px; font-weight: 600; }
+  #toolList .desc { display: block; color: var(--muted); font-size: 12.5px; margin-top: 2px;
+                    overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+  .empty { color: var(--muted); padding: 24px 4px; text-align: center; }
+
+  /* ---- Selected tool: description + generated form ---- */
+  /* Tool names are code, so show them exactly as written (h2 is otherwise small-caps style). */
+  #toolTitle { font-family: var(--mono); font-size: 17px; margin: 0 0 6px; text-transform: none; letter-spacing: 0; color: var(--text); }
+  .tool-desc { white-space: pre-line; color: var(--muted); margin: 0 0 14px; }
+  .field { margin-bottom: 12px; }
+  .field > label { display: block; font-weight: 600; margin-bottom: 4px; }
+  .field .type { font-weight: 400; color: var(--muted); font-family: var(--mono); font-size: 12px; margin-left: 6px; }
+  .field .req { color: var(--danger); margin-left: 2px; }
+  .field .err { color: var(--danger); font-size: 13px; margin-top: 3px; }
+  .field input[type="checkbox"] { width: auto; }
+  .actions { display: flex; gap: 10px; align-items: center; margin-top: 6px; }
+
+  /* ---- Result ---- */
+  #result { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--border); }
+  .result-head { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .result-head .grow { flex: 1; }
+  .tabs { display: inline-flex; border: 1px solid var(--border); border-radius: 7px; overflow: hidden; }
+  .tabs button { border: 0; border-radius: 0; background: transparent; color: var(--muted); padding: 5px 12px; font-weight: 500; }
+  .tabs button[aria-selected="true"] { background: var(--surface-2); color: var(--text); }
+  .result-error { padding: 10px 12px; border: 1px solid var(--danger); background: var(--danger-bg); border-radius: 8px; }
+  .result-error strong { color: var(--danger); }
+  pre.json { margin: 0; padding: 12px; background: var(--surface-2); border-radius: 8px; overflow: auto; max-height: 480px; white-space: pre; }
+  .k { color: var(--key); } .s { color: var(--str); } .n { color: var(--num); } .b { color: var(--bool); }
+  .res-sec { margin-bottom: 14px; }
+  .res-sec .res-sec { margin-top: 14px; }
+  .res-sec h3, .res-sec h4 { margin: 0 0 6px; font-size: 14px; font-family: var(--mono); }
+  .res-sec h4 { color: var(--muted); font-weight: 600; }
+  .tbl-wrap { overflow: auto; max-height: 420px; border: 1px solid var(--border); border-radius: 8px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { position: sticky; top: 0; background: var(--surface-2); font-weight: 600; white-space: nowrap; }
+  tr:last-child th, tr:last-child td { border-bottom: 0; }
+  table.kv th { position: static; width: 1%; white-space: nowrap; background: transparent; color: var(--muted); font-weight: 500; }
+
+  /* ---- Protocol log ---- */
+  #logPanel { margin-top: 14px; }
+  #logPanel > summary { cursor: pointer; font-weight: 600; }
+  .log-entry { border-top: 1px solid var(--border); padding: 6px 0; }
+  .log-entry summary { cursor: pointer; font-family: var(--mono); font-size: 13px; }
+  .log-entry .out { color: var(--accent); } .log-entry .bad { color: var(--danger); }
+  .log-entry pre { margin: 6px 0; padding: 10px; background: var(--surface-2); border-radius: 6px; overflow: auto; max-height: 260px; }
+  .log-entry h5 { margin: 8px 0 0; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Patient DB <span>· MCP browser client</span></h1>
+
+  <section class="card connect" aria-label="Connection">
+    <label for="url">Server URL</label>
+    <input id="url" type="url" value="http://127.0.0.1:8000/mcp" spellcheck="false" autocomplete="off">
+    <button id="connectBtn" type="button">Connect</button>
+    <span id="status" class="pill" role="status">Disconnected</span>
+  </section>
+
+  <div id="banner" role="alert" hidden></div>
+
+  <div class="layout">
+    <aside class="card" aria-label="Tools">
+      <h2>Tools <span id="toolCount"></span></h2>
+      <ul id="toolList"></ul>
+      <p id="toolEmpty" class="empty">Connect to the server to see its tools.</p>
+    </aside>
+
+    <section class="card" aria-label="Selected tool">
+      <p id="panelEmpty" class="empty">Select a tool on the left.</p>
+      <div id="toolPanel" hidden>
+        <h2 id="toolTitle" class="mono"></h2>
+        <p id="toolDesc" class="tool-desc"></p>
+        <form id="toolForm" novalidate></form>
+        <div id="result" hidden></div>
+      </div>
+    </section>
+  </div>
+
+  <details id="logPanel" class="card">
+    <summary>Protocol log (<span id="logCount">0</span> messages)</summary>
+    <div id="log"></div>
+  </details>
+</main>
+
+<script>
+"use strict";
+
+/* ==========================================================================
+   1. Small helpers
+   ========================================================================== */
+
+// Build a DOM element. Strings passed as children become TEXT nodes, so data
+// coming back from the database can never be interpreted as HTML.
+function el(tag, attrs = {}, ...children) {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(attrs)) {
+    if (key === "class") node.className = value;
+    else if (key.startsWith("on")) node.addEventListener(key.slice(2), value);
+    else if (value === true) node.setAttribute(key, "");
+    else if (value !== false && value != null) node.setAttribute(key, value);
+  }
+  node.append(...children);
+  return node;
+}
+const $ = (id) => document.getElementById(id);
+const pretty = (value) => JSON.stringify(value, null, 2);
+
+/* ==========================================================================
+   2. The MCP client: speaks JSON-RPC over "Streamable HTTP"
+   ========================================================================== */
+
+// Thrown when the browser could not get any HTTP response at all.
+class NetworkError extends Error {}
+
+class McpClient {
+  constructor(url, onLog) {
+    this.url = url;
+    this.onLog = onLog;          // called with every request/response, for the Protocol log
+    this.sessionId = null;       // the server gives us one in the reply to "initialize"
+    this.protocolVersion = null;
+    this.serverInfo = null;
+    this.nextId = 1;             // JSON-RPC ids pair each response with its request
+  }
+
+  // ---- The 4 steps from the header comment ----
+
+  async connect() {
+    const result = await this.#request("initialize", {
+      protocolVersion: "2025-11-25",
+      capabilities: {},          // we offer the server nothing (no sampling, roots, ...)
+      clientInfo: { name: "patient-db-browser-client", version: "1.0.0" },
+    });
+    this.protocolVersion = result.protocolVersion;   // the version the server agreed to
+    this.serverInfo = result.serverInfo;
+    await this.#notify("notifications/initialized"); // "I'm ready" - no reply expected
+    return result;
+  }
+
+  async listTools() {
+    const tools = [];
+    let cursor;                  // long lists come in pages; keep asking until no cursor is left
+    do {
+      const page = await this.#request("tools/list", cursor ? { cursor } : {});
+      tools.push(...page.tools);
+      cursor = page.nextCursor;
+    } while (cursor);
+    return tools;
+  }
+
+  callTool(name, args) {
+    return this.#request("tools/call", { name, arguments: args });
+  }
+
+  // Tell the server we're done so it can free the session. Best effort only.
+  async close() {
+    if (!this.sessionId) return;
+    try {
+      await fetch(this.url, { method: "DELETE", headers: this.#headers() });
+    } catch { /* the server may already be gone - nothing to do */ }
+    this.sessionId = null;
+  }
+
+  // ---- Plumbing ----
+
+  #headers() {
+    const headers = {
+      "Content-Type": "application/json",
+      // The server insists we say we can accept BOTH kinds of reply.
+      "Accept": "application/json, text/event-stream",
+    };
+    if (this.sessionId) headers["Mcp-Session-Id"] = this.sessionId;
+    if (this.protocolVersion) headers["MCP-Protocol-Version"] = this.protocolVersion;
+    return headers;
+  }
+
+  // Send a request and wait for the response that carries the same id.
+  async #request(method, params) {
+    const id = this.nextId++;
+    const messages = await this.#post({ jsonrpc: "2.0", id, method, params });
+    const reply = messages.find((m) => m.id === id);
+    if (!reply) throw new Error(`No response to ${method}`);
+    if (reply.error) throw new Error(`${reply.error.message} (code ${reply.error.code})`);
+    return reply.result;
+  }
+
+  // A notification has no id, so the server sends no reply (just HTTP 202).
+  async #notify(method) {
+    await this.#post({ jsonrpc: "2.0", method });
+  }
+
+  async #post(body) {
+    const started = performance.now();
+    let response;
+    try {
+      response = await fetch(this.url, {
+        method: "POST",
+        headers: this.#headers(),
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(30_000),
+      });
+    } catch (error) {
+      // fetch() rejects when the server is down OR when the browser blocked the
+      // request (e.g. CORS). From JavaScript the two look identical.
+      this.onLog({ request: body, error: String(error), ms: performance.now() - started });
+      throw new NetworkError(String(error));
+    }
+
+    // The session id arrives as a response HEADER. JavaScript can only read it
+    // because server.py lists it in Access-Control-Expose-Headers.
+    const sessionId = response.headers.get("Mcp-Session-Id");
+    if (sessionId) this.sessionId = sessionId;
+
+    const text = await response.text();
+    const messages = response.ok ? parseMessages(text, response.headers.get("Content-Type") || "") : [];
+    this.onLog({ request: body, status: response.status, response: messages, rawError: response.ok ? null : text,
+                 ms: performance.now() - started });
+
+    if (!response.ok) {
+      const error = new Error(`HTTP ${response.status}: ${text.slice(0, 300) || response.statusText}`);
+      error.status = response.status;
+      throw error;
+    }
+    return messages;
+  }
+}
+
+// The server may answer a POST either with plain JSON or with a Server-Sent
+// Events stream (text/event-stream). In an SSE stream each event is a block like
+//     event: message
+//     data: {"jsonrpc":"2.0","id":1,"result":{...}}
+// separated by a blank line. Either way we return a list of JSON-RPC messages.
+function parseMessages(text, contentType) {
+  if (!text.trim()) return [];                     // e.g. the 202 reply to a notification
+  if (!contentType.includes("text/event-stream")) {
+    const parsed = JSON.parse(text);
+    return Array.isArray(parsed) ? parsed : [parsed];
+  }
+  return text.split(/\r?\n\r?\n/)
+    .map((event) => event.split(/\r?\n/)
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trimStart())
+      .join("\n"))
+    .filter(Boolean)
+    .map((data) => JSON.parse(data));
+}
+
+/* ==========================================================================
+   3. Showing results: Table / JSON / Raw
+   ========================================================================== */
+
+const isPlainObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+const isScalar = (v) => v === null || typeof v !== "object";
+
+function cellContent(value) {
+  if (value === null || value === undefined) return el("span", { class: "muted" }, "-");
+  if (typeof value === "object") return el("code", {}, JSON.stringify(value));
+  return String(value);
+}
+
+// An array of objects becomes a table with one column per key.
+function tableOf(rows) {
+  const columns = [...new Set(rows.flatMap((row) => Object.keys(row)))];
+  return el("div", { class: "tbl-wrap" }, el("table", {},
+    el("thead", {}, el("tr", {}, ...columns.map((c) => el("th", {}, c)))),
+    el("tbody", {}, ...rows.map((row) => el("tr", {}, ...columns.map((c) => el("td", {}, cellContent(row[c]))))))));
+}
+
+// An object whose values are all simple becomes a two-column key/value table.
+function keyValueTable(entries) {
+  return el("div", { class: "tbl-wrap" }, el("table", { class: "kv" },
+    el("tbody", {}, ...entries.map(([k, v]) => el("tr", {}, el("th", {}, k), el("td", {}, cellContent(v)))))));
+}
+
+// Walk the result and pick a sensible view for each part of it.
+function renderTables(value, title, depth = 0) {
+  const section = el("section", { class: "res-sec" });
+  if (title) section.append(el(depth ? "h4" : "h3", {}, title));
+
+  if (Array.isArray(value)) {
+    if (value.length === 0) section.append(el("p", { class: "muted" }, "(empty)"));
+    else if (value.every(isPlainObject)) section.append(tableOf(value));
+    else section.append(el("code", {}, JSON.stringify(value)));
+  } else if (isPlainObject(value)) {
+    const entries = Object.entries(value);
+    const simple = entries.filter(([, v]) => isScalar(v));
+    if (simple.length) section.append(keyValueTable(simple));
+    for (const [key, child] of entries.filter(([, v]) => !isScalar(v))) {
+      section.append(renderTables(child, Array.isArray(child) ? `${key} (${child.length})` : key, depth + 1));
+    }
+  } else {
+    section.append(String(value));
+  }
+  return section;
+}
+
+// Colour JSON text: keys, strings, numbers, true/false/null. Built from DOM
+// nodes (not innerHTML) so database content can't inject markup.
+const JSON_TOKEN = /("(?:\\.|[^"\\])*")(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/g;
+function highlightJson(text) {
+  const fragment = document.createDocumentFragment();
+  let last = 0;
+  for (const match of text.matchAll(JSON_TOKEN)) {
+    fragment.append(text.slice(last, match.index));
+    if (match[1]) {
+      fragment.append(el("span", { class: match[2] ? "k" : "s" }, match[1]));
+      if (match[2]) fragment.append(match[2]);
+    } else {
+      fragment.append(el("span", { class: match[3] ? "b" : "n" }, match[0]));
+    }
+    last = match.index + match[0].length;
+  }
+  fragment.append(text.slice(last));
+  return fragment;
+}
+
+// A tool result has "content" (text blocks, what an LLM reads) and often also
+// "structuredContent" (the same data as real JSON). Prefer the structured one.
+function extractData(result) {
+  if (result.structuredContent !== undefined && result.structuredContent !== null) return result.structuredContent;
+  const text = (result.content || []).filter((c) => c.type === "text").map((c) => c.text).join("\n");
+  try { return JSON.parse(text); } catch { return text; }
+}
+
+function showResult(tool, args, result, ms) {
+  const panel = $("result");
+  panel.hidden = false;
+  panel.replaceChildren();
+
+  const rawText = (result.content || []).map((c) => c.text ?? `[${c.type} content]`).join("\n");
+  const head = el("div", { class: "result-head" },
+    el("h2", {}, result.isError ? "Tool error" : "Result"),
+    el("span", { class: "muted" }, `${Math.round(ms)} ms`), el("span", { class: "grow" }));
+  panel.append(head);
+
+  // isError means the TOOL failed (unknown patient, bad SQL, ...). The protocol
+  // itself worked fine. The message is meant for an LLM to read and retry.
+  if (result.isError) {
+    panel.append(el("div", { class: "result-error" }, el("strong", {}, "The tool reported an error: "), rawText));
+    return;
+  }
+
+  const data = extractData(result);
+  const views = {
+    Table: () => (typeof data === "object" && data !== null) ? renderTables(data) : el("pre", { class: "json" }, String(data)),
+    JSON: () => el("pre", { class: "json" }, highlightJson(pretty(data))),
+    Raw: () => el("pre", { class: "json" }, pretty(result)),
+  };
+  const body = el("div");
+  const tabs = el("div", { class: "tabs", role: "tablist" });
+  const select = (name) => {
+    for (const tab of tabs.children) tab.setAttribute("aria-selected", String(tab.textContent === name));
+    body.replaceChildren(views[name]());
+  };
+  for (const name of Object.keys(views)) {
+    tabs.append(el("button", { type: "button", role: "tab", class: "secondary", onclick: () => select(name) }, name));
+  }
+  head.append(tabs);
+  panel.append(body);
+  select("Table");
+}
+
+/* ==========================================================================
+   4. Building the argument form from the tool's JSON Schema
+   ========================================================================== */
+
+// The server describes each tool's inputs as JSON Schema. Optional parameters
+// like `int | None` arrive as {anyOf: [{type: "integer"}, {type: "null"}]}, so
+// pick the first non-null option.
+function schemaType(schema) {
+  const options = schema.anyOf ? schema.anyOf.filter((s) => s.type !== "null") : [schema];
+  return options[0]?.type || "string";
+}
+
+function buildForm(tool, onSubmit) {
+  const schema = tool.inputSchema || {};
+  const properties = schema.properties || {};
+  const required = new Set(schema.required || []);
+  const form = $("toolForm");
+  form.replaceChildren();
+
+  for (const [name, prop] of Object.entries(properties)) {
+    const type = schemaType(prop);
+    const id = `arg-${name}`;
+    let input;
+    if (type === "boolean") {
+      input = el("input", { type: "checkbox", id });
+      input.checked = prop.default === true;
+    } else if (type === "integer" || type === "number") {
+      input = el("input", { type: "number", id, step: type === "integer" ? "1" : "any", inputmode: "decimal" });
+      if (prop.default != null) input.value = prop.default;
+    } else if (type === "array" || type === "object") {
+      input = el("textarea", { id, rows: 3, placeholder: "JSON" });
+    } else if (name === "sql") {
+      // A SQL query is long, so it gets a multi-line box.
+      input = el("textarea", { id, rows: 5, spellcheck: "false", placeholder: "SELECT ..." });
+      if (prop.default != null) input.value = prop.default;
+    } else {
+      input = el("input", { type: "text", id, autocomplete: "off", spellcheck: "false" });
+      if (prop.default != null) input.value = prop.default;
+    }
+    input.dataset.name = name;
+    input.dataset.type = type;
+
+    form.append(el("div", { class: "field" },
+      el("label", { for: id }, name,
+        el("span", { class: "type" }, type), required.has(name) ? el("span", { class: "req", title: "required" }, "*") : ""),
+      input, el("div", { class: "err", id: `err-${name}`, hidden: true })));
+  }
+
+  if (Object.keys(properties).length === 0) {
+    form.append(el("p", { class: "muted" }, "This tool takes no arguments."));
+  }
+  form.append(el("div", { class: "actions" }, el("button", { type: "submit", id: "runBtn" }, "Run tool")));
+  form.onsubmit = (event) => { event.preventDefault(); onSubmit(); };
+}
+
+// Read the form back into the {name: value} object that tools/call expects.
+// Returns null (and shows messages next to the fields) if something is invalid.
+function collectArguments(tool) {
+  const required = new Set((tool.inputSchema || {}).required || []);
+  const args = {};
+  let valid = true;
+
+  for (const input of $("toolForm").querySelectorAll("[data-name]")) {
+    const { name, type } = input.dataset;
+    const error = $(`err-${name}`);
+    const fail = (message) => { error.textContent = message; error.hidden = false; valid = false; };
+    error.hidden = true;
+
+    if (type === "boolean") { args[name] = input.checked; continue; }
+    const raw = input.value.trim();
+    if (raw === "") {
+      if (required.has(name)) fail("Required.");
+      continue;                                   // optional + empty -> leave it out, the server uses its default
+    }
+    if (type === "integer") {
+      if (!/^-?\d+$/.test(raw)) fail("Enter a whole number."); else args[name] = Number(raw);
+    } else if (type === "number") {
+      if (!Number.isFinite(Number(raw))) fail("Enter a number."); else args[name] = Number(raw);
+    } else if (type === "array" || type === "object") {
+      try { args[name] = JSON.parse(raw); } catch { fail("Enter valid JSON."); }
+    } else {
+      args[name] = input.value;                   // text: send exactly what was typed
+    }
+  }
+  return valid ? args : null;
+}
+
+/* ==========================================================================
+   5. Page state and wiring
+   ========================================================================== */
+
+let client = null;
+let tools = [];
+let selectedTool = null;
+let logCount = 0;
+
+function setStatus(text, connected) {
+  const pill = $("status");
+  pill.textContent = text;
+  pill.classList.toggle("on", connected);
+  $("connectBtn").textContent = connected ? "Disconnect" : "Connect";
+  $("connectBtn").classList.toggle("secondary", connected);
+}
+
+function showBanner(title, detail, code) {
+  const banner = $("banner");
+  banner.replaceChildren(el("strong", {}, title + " "), detail);
+  if (code) banner.append(el("pre", {}, code));
+  banner.hidden = false;
+}
+const clearBanner = () => { $("banner").hidden = true; };
+
+// Append one line to the Protocol log; click it to expand the raw JSON.
+function logMessage({ request, response, status, error, rawError, ms }) {
+  logCount += 1;
+  $("logCount").textContent = logCount;
+  const failed = Boolean(error) || (status && status >= 400);
+  const label = request.method + (request.id === undefined ? " (notification)" : "");
+  const summary = el("summary", {}, el("span", { class: "out" }, "-> "), label,
+    el("span", { class: failed ? "bad" : "muted" },
+      `   ${error ? "network error" : "HTTP " + status} - ${Math.round(ms)} ms`));
+  $("log").prepend(el("details", { class: "log-entry" }, summary,
+    el("h5", {}, "Request"), el("pre", {}, pretty(request)),
+    el("h5", {}, "Response"), el("pre", {}, error || rawError || (response?.length ? pretty(response) : "(no body)"))));
+}
+
+function networkHelp() {
+  const origin = location.origin;
+  if (origin === "null" || location.protocol === "file:") {
+    return ["This page was opened as a file, so the browser sends the origin \"null\", which the server refuses. Serve the folder instead:",
+            "python -m http.server 3000 --directory client\n# then open http://localhost:3000"];
+  }
+  return [`The browser could not reach the server, or blocked the request. Check that the server is running with this page's origin allowed:`,
+          `python server.py --transport streamable-http --cors-origin ${origin}`];
+}
+
+function renderToolList() {
+  const list = $("toolList");
+  list.replaceChildren();
+  $("toolCount").textContent = tools.length ? `(${tools.length})` : "";
+  $("toolEmpty").hidden = tools.length > 0;
+  for (const tool of tools) {
+    // Docstrings span several lines; flatten to one string and let CSS cut it after 2 lines.
+    const summary = (tool.description || "").replace(/\s+/g, " ").trim();
+    list.append(el("li", {}, el("button", { type: "button", "data-tool": tool.name, onclick: () => selectTool(tool) },
+      el("span", { class: "name" }, tool.name), el("span", { class: "desc" }, summary))));
+  }
+}
+
+function selectTool(tool) {
+  selectedTool = tool;
+  for (const button of $("toolList").querySelectorAll("button")) {
+    button.setAttribute("aria-current", String(button.dataset.tool === tool.name));
+  }
+  $("panelEmpty").hidden = true;
+  $("toolPanel").hidden = false;
+  $("toolTitle").textContent = tool.name;
+  // Docstrings are hard-wrapped in the source. Join single line breaks so the text
+  // reflows to the screen width, but keep blank lines as paragraph breaks.
+  $("toolDesc").textContent = (tool.description || "").trim().replace(/([^\n])\n(?!\n)/g, "$1 ");
+  $("result").hidden = true;
+  buildForm(tool, runSelectedTool);
+}
+
+async function runSelectedTool() {
+  const args = collectArguments(selectedTool);
+  if (!args) return;
+  const button = $("runBtn");
+  button.disabled = true;
+  button.textContent = "Running...";
+  clearBanner();
+  const started = performance.now();
+  try {
+    const result = await client.callTool(selectedTool.name, args);
+    showResult(selectedTool, args, result, performance.now() - started);
+  } catch (error) {
+    handleFailure(error);
+  } finally {
+    button.disabled = false;
+    button.textContent = "Run tool";
+  }
+}
+
+function handleFailure(error) {
+  if (error instanceof NetworkError) {
+    const [message, command] = networkHelp();
+    showBanner("Can't reach the server.", message, command);
+    disconnectUi();
+  } else if (error.status === 404) {
+    // The server forgot our session (it restarted, or it timed out).
+    showBanner("Session expired.", "The server no longer knows this session. Click Connect to start a new one.");
+    disconnectUi();
+  } else {
+    showBanner("Request failed.", error.message);
+  }
+}
+
+function disconnectUi() {
+  client = null;
+  tools = [];
+  selectedTool = null;
+  setStatus("Disconnected", false);
+  renderToolList();
+  $("toolPanel").hidden = true;
+  $("panelEmpty").hidden = false;
+}
+
+async function connect() {
+  clearBanner();
+  const url = $("url").value.trim();
+  try { localStorage.setItem("mcp-url", url); } catch { /* storage can be blocked - not important */ }
+  setStatus("Connecting...", false);
+  $("connectBtn").disabled = true;
+  try {
+    client = new McpClient(url, logMessage);
+    const info = await client.connect();
+    tools = await client.listTools();
+    setStatus(`Connected - ${info.serverInfo?.name ?? "server"} (protocol ${info.protocolVersion})`, true);
+    renderToolList();
+    if (tools.length) selectTool(tools[0]);
+  } catch (error) {
+    handleFailure(error);
+    disconnectUi();
+  } finally {
+    $("connectBtn").disabled = false;
+  }
+}
+
+async function disconnect() {
+  await client?.close();
+  disconnectUi();
+}
+
+$("connectBtn").addEventListener("click", () => (client ? disconnect() : connect()));
+$("url").addEventListener("keydown", (event) => { if (event.key === "Enter" && !client) connect(); });
+try { $("url").value = localStorage.getItem("mcp-url") || $("url").value; } catch { /* ignore */ }
+</script>
+</body>
+</html>
